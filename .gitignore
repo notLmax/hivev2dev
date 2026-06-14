@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+*/session.json
+*/runtime.json
+*/state/
+crash-detect.json
+data/
+config/models.local.yaml
+
+# Owner state — never tracked (matches the A/B lineage convention; the original owner's
+# personal instance data was moved to _reference/ on 2026-06-10)
+agents/
+_reference/
+
+# Maintainer notes — dev-box only, never ships (and never one `git add .`
+# away from shipping, which is why it's ignored rather than just untracked)
+notes/
+
+# shared/exchange — ephemeral inter-agent hand-off files. The dir + its
+# README are tracked; runtime-written hand-offs are throwaway.
+shared/exchange/*
+!shared/exchange/README.md

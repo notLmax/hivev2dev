@@ -1,0 +1,120 @@
+# config/models.yaml — model catalog + per-agent assignments (04 §3).
+#
+# SINGLE SOURCE OF TRUTH for model tiers: pinned IDs, runtime, endpoint,
+# pricing (USD/MTok, feeds src/billing/), and spend caps. Fully additive:
+# delete this file and everything behaves exactly as config.yaml alone.
+#
+# Resolution precedence (src/core/model-catalog.ts):
+#   1. agents.<name>.model below (catalog key)
+#   2. config.yaml per-agent `model:` used AS a catalog key (opt-in shorthand)
+#   3. raw passthrough (any string not matching a key goes straight to the
+#      runtime — current behavior for every existing agent)
+#
+# Assignment is per-agent at session start, NEVER per-turn (04 §9).
+# Escalation = explicit re-run on a higher tier, recorded with a reason.
+#
+# ⚠ Model names in the planning notes are tiers, not IDs — IDs pinned here are the
+# June-2026 verified ones (doc 03 §4). Upgrades happen in this one file.
+
+model_catalog:
+  # ── Cheap tier (anthropic-compat runtime — lands in WP3; assignments to
+  #    these entries are rejected at startup until then) ──────────────────
+  deepseek-flash:
+    runtime: anthropic-compat
+    base_url: https://api.deepseek.com        # native Anthropic Messages format (doc 03 §4)
+    id: deepseek-v4-flash
+    api_key_env: DEEPSEEK_API_KEY
+    price: { in: 0.14, out: 0.28, cached_in: 0.0028 }   # implicit caching, hit ≈ 2% of miss
+    context_window: 1000000
+    quirks: deepseek
+  deepseek-pro:
+    runtime: anthropic-compat
+    base_url: https://api.deepseek.com
+    id: deepseek-v4-pro
+    api_key_env: DEEPSEEK_API_KEY
+    price: { in: 0.435, out: 0.87, cached_in: 0.003625 }
+    context_window: 1000000
+    quirks: deepseek
+  ollama-deepseek:
+    # Current DeepSeek transport: Ollama Cloud. VERIFIED 2026-06-10
+    # via scripts/compat-smoke.mjs: https://ollama.com/v1/messages speaks the
+    # Anthropic Messages format (tool_use round-trip clean, no empty-content
+    # quirk on deepseek). deepseek-v4-flash AND -v4-pro are hosted there, as
+    # is kimi-k2.6. Models emit `thinking` blocks that consume max_tokens —
+    # WP3 runtime must budget for and strip them. Direct DeepSeek API (above)
+    # stays the cost-optimal endgame (first-party implicit caching). Pricing
+    # placeholder until Ollama Cloud billing is pinned; usage still logs.
+    runtime: anthropic-compat
+    base_url: https://ollama.com
+    id: deepseek-v4-flash
+    api_key_env: OLLAMA_API_KEY
+    context_window: 160000                    # conservative; ollama-hosted window unverified
+    quirks: deepseek
+  kimi:
+    # Kimi K2.6 via Ollama Cloud — same transport as ollama-deepseek; hosted
+    # availability + Anthropic-format compatibility VERIFIED 2026-06-10
+    # (scripts/compat-smoke.mjs). Pricing placeholder until Ollama Cloud
+    # billing is pinned (same caveat as ollama-deepseek: spend logs $0 until
+    # then, so caps don't bite on this lane yet).
+    runtime: anthropic-compat
+    base_url: https://ollama.com
+    id: kimi-k2.6
+    api_key_env: OLLAMA_API_KEY
+    context_window: 160000                    # conservative; ollama-hosted window unverified
+    quirks: kimi
+
+  # ── Gemini lane (existing google-adk runtime) ──────────────────────────
+  gemini-flash:
+    runtime: google-adk
+    id: gemini-3.5-flash
+    api_key_env: GEMINI_API_KEY
+    price: { in: 1.50, out: 9.00, cached_in: 0.15 }
+    context_window: 1000000
+  gemini-pro:
+    runtime: google-adk
+    id: gemini-3.1-pro-preview                # no 3.5 Pro GA as of 2026-06 (doc 03 §4)
+    api_key_env: GEMINI_API_KEY
+    price: { in: 2.00, out: 12.00, cached_in: 0.20 }
+    context_window: 1000000
+
+  # ── Claude lane (Agent SDK — consumes the per-seat plan credit) ────────
+  haiku:
+    runtime: claude-agent-sdk
+    id: claude-haiku-4-5
+    price: { in: 1.00, out: 5.00, cached_in: 0.10, cache_write: 1.25 }
+    context_window: 200000
+    # ⚠ 4096-token minimum cacheable length — poor fit for small prompts (doc 03 §2)
+  sonnet:
+    runtime: claude-agent-sdk
+    id: claude-sonnet-4-6
+    price: { in: 3.00, out: 15.00, cached_in: 0.30, cache_write: 3.75 }
+    context_window: 1000000
+  opus:
+    runtime: claude-agent-sdk
+    id: claude-opus-4-8
+    price: { in: 5.00, out: 25.00, cached_in: 0.50, cache_write: 6.25 }
+    context_window: 1000000
+    restricted_to: [eng]                      # owner directive: Opus is eng-only
+
+# Per-agent assignments. SHIPS EMPTY in this repo — existing agents keep their
+# config.yaml models until explicitly assigned a tier (additive rollout).
+# Example:
+#   invoice-clerk: { model: deepseek-flash, tier: standard,
+#                    context_budget: 200000,
+#                    caps: { daily_usd: 2.00, monthly_usd: 40.00 } }
+agents: {}
+
+defaults:
+  # Fleet default tier (owner directive 2026-06-12): every agent with NO
+  # explicit assignment resolves to this entry — IF DEEPSEEK_API_KEY is set
+  # in the install's .env. Without the key the agent stays on exact
+  # passthrough (console warning, never a boot failure), so this line is
+  # INERT until the org key is distributed. Opt-outs, per install:
+  #   - per-agent: assign a tier in config/models.local.yaml (always wins),
+  #     e.g. house-md: { model: sonnet }
+  #   - explicit `runtime:` on the agent in config.yaml (deliberate opt-out)
+  #   - cancel entirely: `defaults: { model: none }` in models.local.yaml
+  model: deepseek-pro
+  # Applies to catalog-resolved agents (incl. fleet-default ones) with no
+  # per-agent caps — deepseek-pro bills API money, so caps matter.
+  caps: { daily_usd: 25.00, monthly_usd: 300.00 }

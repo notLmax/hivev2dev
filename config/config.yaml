@@ -1,0 +1,87 @@
+# Neato Hive — Configuration (v2 development base)
+#
+# 2026-06-10: The original owner's personal roster moved to _reference/agents/
+# (untracked). This file now carries the generic House-MD-only shape the
+# distributable uses. Agent state under agents/ is OWNER STATE — untracked
+# by design (see .gitignore); worked examples live in _reference/agents/.
+
+# Default model for all agents. Raw model ID, or a catalog key from
+# config/models.yaml (see that file for tiers, pricing, and per-agent
+# assignment via config/models.local.yaml).
+model: claude-opus-4-7[1m]
+
+# Agent definitions
+# Each agent gets its own Discord bot, its own channel, its own PM2 process.
+# Launch: pm2 start dist/index.js --name <agent-name> -- --agent <agent-name>
+agents:
+  house-md:
+    channels:
+      - house-md
+    behavior_dir: agents/house-md
+
+  # Per-agent keys (all optional, all additive):
+  #   model: <models.yaml catalog key OR raw model ID>   # default: global model
+  #   runtime: sdk | google-adk | claude-cli             # default: sdk
+  #            (anthropic-compat lands in WP3)
+  #   coding_backend: codex | claude-code                # heavy coding lane
+  #   browser:
+  #     enabled: true                                    # Playwright MCP
+  #   webhook_ingress:
+  #     allowed_ids: ["<discord-webhook-id>"]            # external wake hooks
+  #   state_header: { ... }                              # per-agent overrides of the block below
+  #
+  # Example:
+  # invoice-clerk:
+  #   channels: [invoice-clerk]
+  #   behavior_dir: agents/invoice-clerk
+  #   model: sonnet
+  #   coding_backend: codex
+
+# Session State header (Queen Bee 04 §4.2) — mutable agent state rides the
+# latest user message instead of the system prompt, so WAL writes never bust
+# the cache prefix. ALL keys optional; absent block = the defaults shown.
+# Each include flag drives BOTH eviction from the system prompt AND the header
+# section (one switch, can never disagree). Per-agent overrides: put the same
+# block under an agent. Rollback for any file = flip its flag + restart.
+# state_header:
+#   daily_memory_days: 2
+#   max_section_chars: 8000     # per-section cap; sections keep their tail
+#   include_memory: true        # MEMORY.md
+#   include_tasks: true         # TASKS.md
+#   include_lessons: true       # LESSONS.md
+#   include_output_log: true    # OUTPUT-LOG.md
+#   include_codex_tasks: true   # recent codex-task table
+#   codex_tasks_limit: 5
+
+# Codex MCP (for agents with coding_backend: codex)
+codex:
+  enabled: true
+  command: npx
+  args: ["-y", "codex", "mcp-server"]
+
+# Safety
+safety:
+  blocked_commands:
+    - "rm -rf /"
+    - "rm -rf ~"
+    - "rm -rf /*"
+    - "sudo rm"
+    - "mkfs"
+    - "dd if="
+    - "shutdown"
+    - "reboot"
+    - ":(){:|:&};:"
+
+  # Literal path prefixes agents may read/write/execute under.
+  # SET THESE TO YOUR MACHINE'S WORKING DIRECTORIES before running agents.
+  allowed_paths:
+    - /tmp
+
+  # Paths agents may never read/write/execute under (the hardened safety hook
+  # expands ~ and resolves .. before matching). ~/.ssh and ~/.codex hold
+  # credentials — never expose them to agents.
+  protected_paths:
+    - ~/.ssh
+    - ~/.codex
+    - /etc
+    - /usr

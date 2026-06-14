@@ -1,0 +1,872 @@
+#!/usr/bin/env bash
+#
+# hive — Neato Hive CLI
+#
+# Usage: hive <command> [arguments]
+#
+# Manages agents, sessions, updates, and diagnostics for a Neato Hive installation.
+
+set -uo pipefail
+
+VERSION="2.0.0"
+
+# ---------------------------------------------------------------------------
+# Resolve HIVE_ROOT — works even when called via npm-link symlink
+# ---------------------------------------------------------------------------
+resolve_real_path() {
+  # Use Python to resolve the full symlink chain (works on macOS without coreutils)
+  python3 -c "import os; print(os.path.realpath('$1'))"
+}
+
+SCRIPT_PATH="$(resolve_real_path "$0")"
+HIVE_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
+
+CONFIG_FILE="$HIVE_ROOT/config/config.yaml"
+ENV_FILE="$HIVE_ROOT/.env"
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+info()    { echo -e "${BLUE}[hive]${RESET} $*"; }
+success() { echo -e "${GREEN}[hive]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[hive]${RESET} $*"; }
+error()   { echo -e "${RED}[hive]${RESET} $*" >&2; }
+header()  { echo -e "\n${BOLD}$*${RESET}"; }
+
+# Normalize agent name: join extra words with hyphens, lowercase
+# "house md" → "house-md"
+normalize_agent() {
+  echo "$*" | tr ' ' '-' | tr '[:upper:]' '[:lower:]'
+}
+
+# List all agent names from config.yaml (only entries under the agents: block)
+list_agents() {
+  awk '
+    /^agents:/ { in_agents=1; next }
+    in_agents && /^[a-z]/ { in_agents=0 }
+    in_agents && /^  [a-z]/ {
+      sub(/:.*/, "")
+      gsub(/^[ \t]+/, "")
+      print
+    }
+  ' "$CONFIG_FILE" 2>/dev/null
+}
+
+# Check if an agent exists in config
+agent_exists() {
+  list_agents | grep -qx "$1"
+}
+
+# Get behavior dir for an agent
+agent_behavior_dir() {
+  local agent="$1"
+  local dir
+  dir=$(awk "/^  ${agent}:/{found=1} found && /behavior_dir:/{print \$2; exit}" "$CONFIG_FILE")
+  echo "$HIVE_ROOT/$dir"
+}
+
+# Get channel(s) for an agent
+agent_channels() {
+  local agent="$1"
+  awk "/^  ${agent}:/{found=1} found && /^  [a-z]/ && !/^  ${agent}:/{found=0} found && /- /{gsub(/^.*- /,\"\"); print}" "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+  echo -e "${BOLD}Neato Hive CLI v${VERSION}${RESET}"
+  echo ""
+  echo -e "${BOLD}Usage:${RESET} hive <command> [arguments]"
+  echo ""
+  echo -e "${BOLD}Agent Management${RESET}"
+  echo "  status                     Show all agents and their PM2 status"
+  echo "  list                       List all configured agents"
+  echo "  info <agent>               Show detailed info for an agent"
+  echo "  start <agent|all>          Start an agent (or all agents)"
+  echo "  stop <agent|all>           Stop an agent (or all agents)"
+  echo "  restart <agent|all>        Restart an agent (or all agents)"
+  echo "  logs <agent> [lines]       View agent logs (default: 30 lines)"
+  echo ""
+  echo -e "${BOLD}Sessions${RESET}"
+  echo "  newsession <agent>         Clear an agent's session (next message starts fresh)"
+  echo "  session <agent>            Show current session info for an agent"
+  echo ""
+  echo -e "${BOLD}Build & Update${RESET}"
+  echo "  build                      Compile TypeScript (npm run build)"
+  echo "  update                     Pull latest framework code, rebuild, restart all"
+  echo "  version                    Show Hive CLI and framework version"
+  echo ""
+  echo -e "${BOLD}Diagnostics${RESET}"
+  echo "  doctor                     Run health checks on the entire Hive"
+  echo "  env                        Show .env status (which keys are set, no values)"
+  echo "  config                     Show parsed config summary"
+  echo ""
+  echo -e "${BOLD}Examples${RESET}"
+  echo "  hive status"
+  echo "  hive start house-md"
+  echo "  hive restart all"
+  echo "  hive logs house-md 50"
+  echo "  hive newsession house-md"
+  echo "  hive doctor"
+}
+
+cmd_version() {
+  echo -e "${BOLD}Neato Hive${RESET} v${VERSION}"
+  echo -e "${DIM}Root: ${HIVE_ROOT}${RESET}"
+
+  # Show git info if available
+  if [ -d "$HIVE_ROOT/.git" ]; then
+    local branch commit
+    branch=$(cd "$HIVE_ROOT" && git branch --show-current 2>/dev/null || echo "unknown")
+    commit=$(cd "$HIVE_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo -e "${DIM}Branch: ${branch} (${commit})${RESET}"
+  fi
+
+  # Show node version
+  echo -e "${DIM}Node: $(node --version 2>/dev/null || echo "not found")${RESET}"
+}
+
+cmd_status() {
+  header "Hive Status"
+  pm2 status 2>/dev/null || error "PM2 is not running. Install with: npm install -g pm2"
+}
+
+cmd_list() {
+  header "Configured Agents"
+  echo ""
+  printf "  ${BOLD}%-20s %-25s %-15s${RESET}\n" "AGENT" "CHANNEL(S)" "CODING BACKEND"
+  echo "  $(printf '%.0s─' {1..60})"
+
+  for agent in $(list_agents); do
+    local channels coding_backend
+    channels=$(agent_channels "$agent" | paste -sd, -)
+    coding_backend=$(awk "/^  ${agent}:/{found=1} found && /coding_backend:/{print \$2; exit} found && /^  [a-z]/ && !/^  ${agent}:/{exit}" "$CONFIG_FILE")
+    [ -z "$coding_backend" ] && coding_backend="—"
+    printf "  %-20s %-25s %-15s\n" "$agent" "$channels" "$coding_backend"
+  done
+  echo ""
+}
+
+cmd_info() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive info <agent>"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found in config. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  local bdir
+  bdir=$(agent_behavior_dir "$agent")
+
+  header "Agent: $agent"
+
+  # Channel(s)
+  echo -e "\n${BOLD}Channel(s):${RESET}"
+  agent_channels "$agent" | while read -r ch; do echo "  #$ch"; done
+
+  # Behavior files
+  echo -e "\n${BOLD}Behavior Files:${RESET} ${DIM}($bdir)${RESET}"
+  if [ -d "$bdir" ]; then
+    for f in "$bdir"/*.md; do
+      [ -f "$f" ] && echo "  $(basename "$f")"
+    done
+  else
+    warn "  Directory not found!"
+  fi
+
+  # Memory files
+  local memdir="$bdir/memory"
+  echo -e "\n${BOLD}Daily Memory Files:${RESET}"
+  if [ -d "$memdir" ]; then
+    local count
+    count=$(ls "$memdir"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$count" -gt 0 ]; then
+      echo "  $count file(s)"
+      ls -1 "$memdir"/*.md 2>/dev/null | tail -5 | while read -r f; do
+        echo "  $(basename "$f")"
+      done
+      [ "$count" -gt 5 ] && echo "  ${DIM}... and $((count - 5)) more${RESET}"
+    else
+      echo "  ${DIM}(none yet)${RESET}"
+    fi
+  else
+    echo "  ${DIM}(no memory directory)${RESET}"
+  fi
+
+  # Session
+  local session_file="$bdir/session.json"
+  echo -e "\n${BOLD}Session:${RESET}"
+  if [ -f "$session_file" ]; then
+    local sid updated
+    sid=$(python3 -c "import json; d=json.load(open('$session_file')); print(d.get('sessionId','')[:12])" 2>/dev/null || echo "")
+    updated=$(python3 -c "import json; d=json.load(open('$session_file')); print(d.get('updatedAt','unknown'))" 2>/dev/null || echo "unknown")
+    if [ -n "$sid" ] && [ "$sid" != "" ]; then
+      echo "  ID: ${sid}..."
+      echo "  Updated: $updated"
+    else
+      echo "  ${DIM}(no active session)${RESET}"
+    fi
+  else
+    echo "  ${DIM}(no session file)${RESET}"
+  fi
+
+  # PM2 status
+  echo -e "\n${BOLD}PM2 Process:${RESET}"
+  local pm2_info
+  pm2_info=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for p in data:
+    if p['name'] == '$agent':
+        status = p['pm2_env']['status']
+        uptime = p['pm2_env'].get('pm_uptime', 0)
+        restarts = p['pm2_env'].get('restart_time', 0)
+        pid = p.get('pid', 'N/A')
+        print(f'  Status: {status}')
+        print(f'  PID: {pid}')
+        print(f'  Restarts: {restarts}')
+        sys.exit(0)
+print('  Not running in PM2')
+" 2>/dev/null || echo "  Could not query PM2")
+  echo "$pm2_info"
+  echo ""
+}
+
+cmd_start() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive start <agent|all>"
+    return 1
+  fi
+
+  if [ "$agent" = "all" ]; then
+    header "Starting all agents"
+    for a in $(list_agents); do
+      _start_agent "$a"
+    done
+    pm2 save --force 2>/dev/null
+    success "All agents started."
+    return 0
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  _start_agent "$agent"
+  pm2 save --force 2>/dev/null
+}
+
+_start_agent() {
+  local agent="$1"
+  local token_var
+  token_var="DISCORD_BOT_TOKEN_$(echo "$agent" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+
+  # Check if token exists in .env
+  if ! grep -q "^${token_var}=" "$ENV_FILE" 2>/dev/null; then
+    error "$agent: Missing $token_var in .env"
+    return 1
+  fi
+
+  # Check if already running
+  if pm2 describe "$agent" &>/dev/null; then
+    warn "$agent: Already registered in PM2. Use 'hive restart $agent' instead."
+    return 0
+  fi
+
+  info "Starting $agent..."
+  (cd "$HIVE_ROOT" && pm2 start dist/index.js --name "$agent" -- --agent "$agent")
+  success "$agent: Started."
+}
+
+cmd_stop() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive stop <agent|all>"
+    return 1
+  fi
+
+  if [ "$agent" = "all" ]; then
+    header "Stopping all agents"
+    pm2 stop all 2>/dev/null
+    pm2 save --force 2>/dev/null
+    success "All agents stopped."
+    return 0
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  info "Stopping $agent..."
+  pm2 stop "$agent" 2>/dev/null || warn "$agent not found in PM2."
+  pm2 save --force 2>/dev/null
+  success "$agent: Stopped."
+}
+
+cmd_restart() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive restart <agent|all>"
+    return 1
+  fi
+
+  if [ "$agent" = "all" ]; then
+    header "Restarting all agents"
+    pm2 restart all 2>/dev/null
+    pm2 save --force 2>/dev/null
+    success "All agents restarted."
+    return 0
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  info "Restarting $agent..."
+  pm2 restart "$agent" 2>/dev/null || warn "$agent not found in PM2. Use 'hive start $agent' first."
+  pm2 save --force 2>/dev/null
+  success "$agent: Restarted."
+}
+
+cmd_logs() {
+  local agent lines
+  agent=$(normalize_agent "$1")
+  lines="${2:-30}"
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive logs <agent> [lines]"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  pm2 logs "$agent" --lines "$lines" --nostream 2>/dev/null || error "Could not fetch logs for $agent."
+}
+
+cmd_newsession() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive newsession <agent>"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  local bdir session_file
+  bdir=$(agent_behavior_dir "$agent")
+  session_file="$bdir/session.json"
+
+  if [ -f "$session_file" ]; then
+    echo '{"sessionId":"","updatedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$session_file"
+    success "$agent: Session cleared. Next Discord message starts a fresh conversation."
+  else
+    warn "$agent: No session file found (agent may not have been messaged yet)."
+  fi
+}
+
+cmd_session() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive session <agent>"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  local bdir session_file
+  bdir=$(agent_behavior_dir "$agent")
+  session_file="$bdir/session.json"
+
+  if [ -f "$session_file" ]; then
+    echo -e "${BOLD}Session for $agent:${RESET}"
+    python3 -c "
+import json
+with open('$session_file') as f:
+    d = json.load(f)
+sid = d.get('sessionId', '')
+updated = d.get('updatedAt', 'unknown')
+if sid:
+    print(f'  Session ID: {sid}')
+    print(f'  Updated: {updated}')
+else:
+    print('  No active session.')
+" 2>/dev/null || cat "$session_file"
+  else
+    echo "  No session file found."
+  fi
+}
+
+cmd_build() {
+  header "Building Hive"
+  info "Compiling TypeScript..."
+  (cd "$HIVE_ROOT" && npm run build)
+  success "Build complete."
+}
+
+cmd_update() {
+  header "Updating Hive"
+
+  # Check if git repo
+  if [ ! -d "$HIVE_ROOT/.git" ]; then
+    error "Not a git repository. Cannot update."
+    error "If you installed manually, re-clone from GitHub and run setup.sh."
+    return 1
+  fi
+
+  cd "$HIVE_ROOT"
+
+  # Check for uncommitted changes in framework files
+  local dirty
+  dirty=$(git diff --name-only -- src/ package.json package-lock.json tsconfig.json vitest.config.ts tests/ bin/ setup.sh README.md .env.example templates/ shared/ skills/ scripts/ docs/ config/models.yaml 2>/dev/null)
+  if [ -n "$dirty" ]; then
+    warn "You have local changes to framework files:"
+    echo "$dirty" | sed 's/^/  /'
+    echo ""
+    read -r -p "Overwrite these with the latest version? (y/N) " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      info "Update cancelled."
+      return 0
+    fi
+  fi
+
+  # Fetch latest
+  info "Fetching latest from origin..."
+  git fetch origin main 2>/dev/null || git fetch origin 2>/dev/null || {
+    error "Could not fetch from remote. Check your internet connection and GitHub access."
+    return 1
+  }
+
+  # Determine the default branch
+  local default_branch
+  default_branch=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}')
+  [ -z "$default_branch" ] && default_branch="main"
+
+  # Checkout ONLY framework files from remote. Owner state is never listed:
+  # agents/, data/, .env, config/config.yaml (roster), config/models.local.yaml.
+  # config/models.yaml IS framework — catalog repins ship through releases —
+  # but only as an explicit file path, never config/ wholesale.
+  info "Updating framework files..."
+  local framework_paths=(
+    "src/"
+    "package.json"
+    "package-lock.json"
+    "tsconfig.json"
+    "vitest.config.ts"
+    "tests/"
+    "bin/"
+    "setup.sh"
+    "README.md"
+    ".env.example"
+    ".gitignore"
+    "templates/"
+    "shared/"
+    "skills/"
+    "scripts/"
+    "docs/"
+    "config/models.yaml"
+  )
+
+  for path in "${framework_paths[@]}"; do
+    git checkout "origin/${default_branch}" -- "$path" 2>/dev/null && \
+      echo "  Updated: $path" || true
+  done
+
+  # Install dependencies (in case package.json changed)
+  info "Installing dependencies..."
+  npm install --silent 2>/dev/null
+
+  # Rebuild
+  info "Rebuilding..."
+  npm run build 2>/dev/null
+
+  # Restart all running agents
+  info "Restarting agents..."
+  pm2 restart all 2>/dev/null || warn "No PM2 processes to restart."
+  pm2 save --force 2>/dev/null
+
+  echo ""
+  success "Update complete!"
+  echo -e "${DIM}  Framework files updated. Your agents, config, .env, and memory are untouched.${RESET}"
+}
+
+cmd_doctor() {
+  header "Hive Doctor"
+  echo ""
+
+  local issues=0
+
+  # 1. Node.js
+  printf "  %-35s" "Node.js installed"
+  if command -v node &>/dev/null; then
+    local node_ver
+    node_ver=$(node --version)
+    local major
+    major=$(echo "$node_ver" | sed 's/v//' | cut -d. -f1)
+    if [ "$major" -ge 18 ]; then
+      echo -e "${GREEN}OK${RESET} ($node_ver)"
+    else
+      echo -e "${RED}WARN${RESET} ($node_ver — need v18+)"
+      issues=$((issues + 1))
+    fi
+  else
+    echo -e "${RED}FAIL${RESET}"
+    issues=$((issues + 1))
+  fi
+
+  # 2. PM2
+  printf "  %-35s" "PM2 installed"
+  if command -v pm2 &>/dev/null; then
+    echo -e "${GREEN}OK${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET} — install with: npm install -g pm2"
+    issues=$((issues + 1))
+  fi
+
+  # 3. Claude CLI
+  printf "  %-35s" "Claude CLI installed"
+  if command -v claude &>/dev/null; then
+    echo -e "${GREEN}OK${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET} — install from https://docs.anthropic.com/en/docs/claude-cli"
+    issues=$((issues + 1))
+  fi
+
+  # 4. Claude CLI authenticated
+  printf "  %-35s" "Claude CLI authenticated"
+  if claude auth status &>/dev/null 2>&1; then
+    echo -e "${GREEN}OK${RESET}"
+  else
+    echo -e "${YELLOW}WARN${RESET} — run: claude setup-token"
+    issues=$((issues + 1))
+  fi
+
+  # 4a. Claude auth type (API key vs subscription)
+  printf "  %-35s" "Claude auth type"
+  local auth_output
+  auth_output=$(claude auth status 2>&1 || true)
+  if echo "$auth_output" | grep -qi "api.key\|api_key\|apikey"; then
+    echo -e "${RED}FAIL${RESET} — using API key, not subscription"
+    echo -e "    ${DIM}Hive requires Claude MAX/Pro. Run: claude setup-token${RESET}"
+    issues=$((issues + 1))
+  else
+    echo -e "${GREEN}OK${RESET} (subscription)"
+  fi
+
+  # 4b. ANTHROPIC_API_KEY conflict
+  printf "  %-35s" "No ANTHROPIC_API_KEY conflict"
+  local api_key_found=false
+  local api_key_locations=""
+
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    api_key_found=true
+    api_key_locations="environment"
+  fi
+
+  for rc_file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.bash_profile"; do
+    if [ -f "$rc_file" ] && grep -q "ANTHROPIC_API_KEY" "$rc_file" 2>/dev/null; then
+      api_key_found=true
+      api_key_locations="${api_key_locations:+$api_key_locations, }$(basename "$rc_file")"
+    fi
+  done
+
+  if [ "$api_key_found" = true ]; then
+    echo -e "${RED}CONFLICT${RESET} — found in: $api_key_locations"
+    echo -e "    ${DIM}This overrides your subscription and causes billing errors.${RESET}"
+    echo -e "    ${DIM}Remove ANTHROPIC_API_KEY from your shell profile and restart your terminal.${RESET}"
+    issues=$((issues + 1))
+  else
+    echo -e "${GREEN}OK${RESET}"
+  fi
+
+  # 5. Build exists
+  printf "  %-35s" "TypeScript compiled (dist/)"
+  if [ -f "$HIVE_ROOT/dist/index.js" ]; then
+    echo -e "${GREEN}OK${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET} — run: hive build"
+    issues=$((issues + 1))
+  fi
+
+  # 6. Build freshness
+  printf "  %-35s" "Build is current"
+  if [ -f "$HIVE_ROOT/dist/index.js" ] && [ -d "$HIVE_ROOT/src" ]; then
+    local src_mod dist_mod
+    src_mod=$(find "$HIVE_ROOT/src" -name '*.ts' -newer "$HIVE_ROOT/dist/index.js" 2>/dev/null | head -1)
+    if [ -z "$src_mod" ]; then
+      echo -e "${GREEN}OK${RESET}"
+    else
+      echo -e "${YELLOW}STALE${RESET} — source changed since last build. Run: hive build"
+      issues=$((issues + 1))
+    fi
+  else
+    echo -e "${DIM}SKIP${RESET} (no build to check)"
+  fi
+
+  # 7. .env exists
+  printf "  %-35s" ".env file exists"
+  if [ -f "$ENV_FILE" ]; then
+    echo -e "${GREEN}OK${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET} — copy .env.example to .env and fill in values"
+    issues=$((issues + 1))
+  fi
+
+  # 8. Owner ID set
+  printf "  %-35s" "DISCORD_OWNER_ID set"
+  if grep -q '^DISCORD_OWNER_ID=.' "$ENV_FILE" 2>/dev/null; then
+    echo -e "${GREEN}OK${RESET}"
+  else
+    echo -e "${RED}FAIL${RESET} — set your Discord user ID in .env"
+    issues=$((issues + 1))
+  fi
+
+  # 8b. Shared prompt files — injected into EVERY agent by the prompt
+  # builder (CRITICAL-RULES.md is the precedence root; GLOBAL-TOOLS.md the
+  # tool doctrine). These live in shared/, never per-agent.
+  for shared_file in CRITICAL-RULES.md GLOBAL-TOOLS.md; do
+    printf "  %-35s" "shared/$shared_file"
+    if [ -f "$HIVE_ROOT/shared/$shared_file" ]; then
+      echo -e "${GREEN}OK${RESET}"
+    else
+      echo -e "${YELLOW}MISSING${RESET} — run: hive update"
+      issues=$((issues + 1))
+    fi
+  done
+
+  # 9. Check each agent
+  echo ""
+  echo -e "  ${BOLD}Agent Health:${RESET}"
+  for agent in $(list_agents); do
+    echo ""
+    echo -e "  ${CYAN}$agent${RESET}"
+
+    # Bot token
+    local token_var
+    token_var="DISCORD_BOT_TOKEN_$(echo "$agent" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    printf "    %-33s" "Bot token ($token_var)"
+    if grep -q "^${token_var}=." "$ENV_FILE" 2>/dev/null; then
+      echo -e "${GREEN}SET${RESET}"
+    else
+      echo -e "${RED}MISSING${RESET}"
+      issues=$((issues + 1))
+    fi
+
+    # Behavior directory
+    local bdir
+    bdir=$(agent_behavior_dir "$agent")
+    printf "    %-33s" "Behavior directory"
+    if [ -d "$bdir" ]; then
+      echo -e "${GREEN}OK${RESET}"
+    else
+      echo -e "${RED}MISSING${RESET} ($bdir)"
+      issues=$((issues + 1))
+    fi
+
+    # Required files (per-agent behavior set, as shipped by every template;
+    # CRITICAL-RULES/GLOBAL-TOOLS are shared/ files — checked above, not here)
+    for required_file in IDENTITY.md AGENTS.md SOUL.md USER.md; do
+      printf "    %-33s" "  $required_file"
+      if [ -f "$bdir/$required_file" ]; then
+        echo -e "${GREEN}OK${RESET}"
+      else
+        echo -e "${YELLOW}MISSING${RESET}"
+        issues=$((issues + 1))
+      fi
+    done
+
+    # Memory directory
+    printf "    %-33s" "Memory directory"
+    if [ -d "$bdir/memory" ]; then
+      local mem_count
+      mem_count=$(ls "$bdir/memory/"*.md 2>/dev/null | wc -l | tr -d ' ')
+      echo -e "${GREEN}OK${RESET} ($mem_count daily file(s))"
+    else
+      echo -e "${YELLOW}MISSING${RESET}"
+      issues=$((issues + 1))
+    fi
+
+    # PM2 process
+    printf "    %-33s" "PM2 process"
+    if pm2 describe "$agent" &>/dev/null; then
+      local pm2_status
+      pm2_status=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for p in data:
+    if p['name'] == '$agent':
+        print(p['pm2_env']['status'])
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null || echo "unknown")
+      if [ "$pm2_status" = "online" ]; then
+        echo -e "${GREEN}ONLINE${RESET}"
+      else
+        echo -e "${RED}${pm2_status}${RESET}"
+        issues=$((issues + 1))
+      fi
+    else
+      echo -e "${RED}NOT RUNNING${RESET}"
+      issues=$((issues + 1))
+    fi
+  done
+
+  # Summary
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    success "All checks passed. Hive is healthy."
+  else
+    warn "$issues issue(s) found."
+  fi
+  echo ""
+}
+
+cmd_env() {
+  header ".env Status"
+  echo ""
+
+  if [ ! -f "$ENV_FILE" ]; then
+    error ".env file not found at $ENV_FILE"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+    local key value
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    printf "  %-40s" "$key"
+    if [ -n "$value" ]; then
+      # Mask the value — show first 6 chars then ***
+      local masked
+      if [ "${#value}" -gt 6 ]; then
+        masked="${value:0:6}***"
+      else
+        masked="***"
+      fi
+      echo -e "${GREEN}SET${RESET} (${DIM}${masked}${RESET})"
+    else
+      echo -e "${RED}EMPTY${RESET}"
+    fi
+  done < "$ENV_FILE"
+  echo ""
+}
+
+cmd_config() {
+  header "Hive Configuration"
+  echo -e "${DIM}$CONFIG_FILE${RESET}"
+  echo ""
+
+  if [ ! -f "$CONFIG_FILE" ]; then
+    error "Config file not found at $CONFIG_FILE"
+    return 1
+  fi
+
+  # Model
+  local model
+  model=$(grep '^model:' "$CONFIG_FILE" | awk '{print $2}')
+  echo -e "  ${BOLD}Model:${RESET} $model"
+
+  # Codex
+  local codex_enabled
+  codex_enabled=$(awk '/^codex:/{found=1} found && /enabled:/{print $2; exit}' "$CONFIG_FILE")
+  echo -e "  ${BOLD}Codex MCP:${RESET} $codex_enabled"
+
+  # Agents
+  echo -e "\n  ${BOLD}Agents:${RESET}"
+  for agent in $(list_agents); do
+    local channels coding
+    channels=$(agent_channels "$agent" | paste -sd, -)
+    coding=$(awk "/^  ${agent}:/{found=1} found && /coding_backend:/{print \$2; exit} found && /^  [a-z]/ && !/^  ${agent}:/{exit}" "$CONFIG_FILE")
+    [ -n "$coding" ] && coding=" [${coding}]" || coding=""
+    echo "    $agent → #$channels$coding"
+  done
+
+  # Safety
+  echo -e "\n  ${BOLD}Blocked Commands:${RESET} $(grep -c '^\s*- "' "$CONFIG_FILE" 2>/dev/null | head -1) pattern(s)"
+  echo -e "  ${BOLD}Allowed Paths:${RESET}"
+  awk '/^  allowed_paths:/{found=1; next} found && /^  [a-z]/{exit} found && /- /{gsub(/^.*- /,"    "); print}' "$CONFIG_FILE"
+  echo -e "  ${BOLD}Protected Paths:${RESET}"
+  awk '/^  protected_paths:/{found=1; next} found && /^  [a-z]/{exit} found && /- /{gsub(/^.*- /,"    "); print}' "$CONFIG_FILE"
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Main router
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    help|--help|-h)       cmd_help ;;
+    version|--version|-v) cmd_version ;;
+    status)               cmd_status ;;
+    list|ls)              cmd_list ;;
+    info)                 cmd_info "$@" ;;
+    start)                cmd_start "$@" ;;
+    stop)                 cmd_stop "$@" ;;
+    restart)              cmd_restart "$@" ;;
+    logs|log)             cmd_logs "$@" ;;
+    newsession)           cmd_newsession "$@" ;;
+    session)              cmd_session "$@" ;;
+    build)                cmd_build ;;
+    update)               cmd_update ;;
+    doctor)               cmd_doctor ;;
+    env)                  cmd_env ;;
+    config)               cmd_config ;;
+    *)
+      error "Unknown command: $cmd"
+      echo ""
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
